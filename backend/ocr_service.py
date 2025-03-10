@@ -1,5 +1,4 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from paddleocr import PaddleOCR, draw_ocr
 import cv2
 import numpy as np
@@ -9,43 +8,31 @@ import re
 from datetime import datetime
 import os
 from groq import Groq
-from dotenv import load_dotenv
-from fastapi.responses import JSONResponse
-import easyocr
 import logging
 from typing import List, Dict, Any
-
-# Load environment variables from .env file
-load_dotenv()
-
-app = FastAPI()
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://localhost:8080"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Set environment variable to avoid library conflicts
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-
-# Initialize Groq client with API key
-groq_api_key = os.getenv('GROQ_API_KEY')
-if not groq_api_key:
-    raise ValueError("GROQ_API_KEY environment variable is not set")
-
-# Initialize Groq client
-groq_client = Groq(api_key=groq_api_key)
-
-# Initialize OCR
-ocr = None
-
+import speech_recognition as sr
+from pydub import AudioSegment
+import tempfile
+import shutil
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+import nyckel
+# Initialize OCR
+ocr = None
+credentials=nyckel.Credentials(client_id="ktbbnfo7j0z200v5mm16bw0cyhn8vw03", client_secret="rvq97m9bvimyxfi4r0gxb53ntyc5sgbmzwb5amyzdqas92fizihvg3rmr2g893if")
+# nyckel.invoke("prescription-pad-authenticity", "https://res.cloudinary.com/dbdgtr3re/image/upload/v1741553908/GIH/test_ocr_pnj4v2.jpg", credentials)
+
+# Initialize Groq client (assuming it's configured elsewhere)
+groq_client = None
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    if groq_api_key:
+        groq_client = Groq(api_key=groq_api_key)
+except Exception as e:
+    logger.error(f"Failed to initialize Groq client: {e}")
 
 def get_ocr():
     global ocr
@@ -58,17 +45,7 @@ def get_ocr():
         )
     return ocr
 
-def extract_score(value):
-    """Extracts the first float number from a string or tuple."""
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        match = re.search(r"\d+(\.\d+)?", value)
-        return float(match.group()) if match else 0.0
-    if isinstance(value, tuple):
-        return extract_score(value[0])
-    return 0.0
-
+# Text extraction helper functions
 def extract_text_and_confidence(result):
     """Extract text and confidence scores from OCR result."""
     extracted_data = []
@@ -91,7 +68,7 @@ def extract_text_and_confidence(result):
     
     # Get summary using Groq if text is available
     summary = ""
-    if combined_text.strip():
+    if combined_text.strip() and groq_client:
         try:
             chat_completion = groq_client.chat.completions.create(
                 messages=[{
@@ -102,7 +79,7 @@ def extract_text_and_confidence(result):
             )
             summary = chat_completion.choices[0].message.content
         except Exception as e:
-            print(f"Error getting summary: {e}")
+            logger.error(f"Error getting summary: {e}")
             summary = "Error generating summary"
     
     return {
@@ -127,21 +104,54 @@ def extract_date(text):
 
 def extract_names(text):
     """Extract potential patient and doctor names."""
-    name_patterns = [
-        r'Dr\.\s[A-Z][a-z]+\s[A-Z][a-z]+',
-        r'Patient:\s[A-Z][a-z]+\s[A-Z][a-z]+',
-        r'Name:\s[A-Z][a-z]+\s[A-Z][a-z]+'
-    ]
-    
+    # Default values
     doctor_name = ""
     patient_name = ""
     
-    for line in text.split('\n'):
-        if 'Dr.' in line:
-            doctor_name = line.strip()
-        elif 'Patient:' in line or 'Name:' in line:
-            patient_name = line.split(':')[-1].strip()
+    # More specific patterns for doctor names
+    doctor_patterns = [
+        r'Dr\.\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # Dr. Lastname or Dr. Firstname Lastname
+        r'Doctor:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # Doctor: Name
+        r'Physician:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'  # Physician: Name
+    ]
+    
+    # More specific patterns for patient names
+    patient_patterns = [
+        r'Patient:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # Patient: Name
+        r'Name:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',  # Name: Name
+        r'Patient Name:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'  # Patient Name: Name
+    ]
+    
+    # Try to extract doctor name using patterns
+    for pattern in doctor_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            doctor_name = match.group(1).strip()
+            break
+    
+    # Try to extract patient name using patterns
+    for pattern in patient_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            patient_name = match.group(1).strip()
+            break
+    
+    # If no patterns matched, try line-by-line approach as fallback
+    if not doctor_name or not patient_name:
+        for line in text.split('\n'):
+            line = line.strip()
+            if not doctor_name and ('Dr.' in line or 'Doctor:' in line or 'Physician:' in line):
+                # Extract name after Dr./Doctor:/Physician:
+                parts = re.split(r'Dr\.|Doctor:|Physician:', line, 1)
+                if len(parts) > 1:
+                    doctor_name = parts[1].strip()
             
+            if not patient_name and ('Patient:' in line or 'Name:' in line or 'Patient Name:' in line):
+                # Extract name after Patient:/Name:/Patient Name:
+                parts = re.split(r'Patient:|Name:|Patient Name:', line, 1)
+                if len(parts) > 1:
+                    patient_name = parts[1].strip()
+    
     return patient_name, doctor_name
 
 def extract_medicines(text):
@@ -158,447 +168,286 @@ def extract_medicines(text):
         for pattern in medicine_patterns:
             matches = re.finditer(pattern, line, re.IGNORECASE)
             for match in matches:
-                medicine = {
-                    'name': match.group('name'),
-                    'dosage': match.group('dosage') if 'dosage' in match.groupdict() else '',
-                    'quantity': 0,
-                    'confidence': 0.9
-                }
-                medicines.append(medicine)
+                try:
+                    medicine = {
+                        'name': match.group('name'),
+                        'dosage': match.group('dosage') if 'dosage' in match.groupdict() else '',
+                        'quantity': 0,
+                        'confidence': 0.9
+                    }
+                    medicines.append(medicine)
+                except IndexError:
+                    # Skip if group not found
+                    continue
     
     return medicines
 
-@app.get("/")
-async def root():
-    return {"status": "healthy", "message": "OCR Service is running"}
-
-@app.post("/process-prescription")
-async def process_prescription(file: UploadFile = File(...)):
+async def convert_audio_to_wav(audio_bytes):
+    """Convert audio bytes to WAV format using pydub."""
+    temp_dir = None
+    temp_input_path = None
+    temp_output_path = None
+    
     try:
-        # Initialize OCR if not already done
-        ocr_instance = get_ocr()
+        # Create a temporary directory for our files
+        temp_dir = tempfile.mkdtemp()
+        temp_input_path = os.path.join(temp_dir, 'input.webm')
+        temp_output_path = os.path.join(temp_dir, 'output.wav')
         
-        # Read image file
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
+        # Write the audio bytes to a temporary file
+        with open(temp_input_path, 'wb') as f:
+            f.write(audio_bytes)
         
-        # Convert PIL Image to numpy array
-        img_array = np.array(image)
+        # Define formats to try
+        formats_to_try = ['webm', 'wav', None]  # None means try as generic format
         
-        # Perform OCR
-        result = ocr_instance.ocr(img_array, cls=True)
+        audio = None
+        last_error = None
         
-        if not result or len(result) == 0:
-            return {
-                "results": [],
-                "message": "No text detected in image"
-            }
-        
-        # Extract text and confidence scores
-        extracted_data = extract_text_and_confidence(result)
-        
-        # Combine all text for processing
-        full_text = extracted_data["full_text"]
-        
-        # Extract structured information
-        patient_name, doctor_name = extract_names(full_text)
-        date = extract_date(full_text)
-        medicines = extract_medicines(full_text)
-        
-        # Calculate average confidence
-        confidences = [item["confidence"] for item in extracted_data["extracted_data"]]
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-        
-        # Generate annotated image
-        boxes = [item["box"] for item in extracted_data["extracted_data"]]
-        texts = [item["text"] for item in extracted_data["extracted_data"]]
-        scores = [item["confidence"] for item in extracted_data["extracted_data"]]
-        
-        try:
-            font = ImageFont.load_default()
-            annotated_image = draw_ocr(image, boxes, texts, scores)
-            annotated_image = Image.fromarray(annotated_image)
-            
-            # Save annotated image to bytes
-            img_byte_arr = io.BytesIO()
-            annotated_image.save(img_byte_arr, format='PNG')
-            annotated_image_bytes = img_byte_arr.getvalue()
-            
-        except Exception as e:
-            print(f"Error generating annotated image: {str(e)}")
-            annotated_image_bytes = None
-        
-        return {
-            "results": extracted_data["extracted_data"],
-            "structured_data": {
-                "patient_name": patient_name,
-                "doctor_name": doctor_name,
-                "date": date,
-                "medicines": medicines,
-                "confidence": avg_confidence,
-                "raw_text": full_text
-            },
-            "annotated_image": annotated_image_bytes
-        }
-
-
-
-
-        
-    except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
-
-
-##################### Multilingual OCR #####################
-
-# Initialize EasyOCR reader
-def get_easyocr_reader(lang_pair=['en']):
-    try:
-        return easyocr.Reader(lang_pair)
-    except Exception as e:
-        logger.error(f"Error initializing EasyOCR: {e}")
-        return None
-
-def calculate_iou(box1, box2):
-    # Convert boxes to format [x1, y1, x2, y2]
-    def get_box_coords(box):
-        return [
-            min(p[0] for p in box),
-            min(p[1] for p in box),
-            max(p[0] for p in box),
-            max(p[1] for p in box)
-        ]
-    
-    box1_coords = get_box_coords(box1)
-    box2_coords = get_box_coords(box2)
-    
-    # Calculate intersection
-    x1 = max(box1_coords[0], box2_coords[0])
-    y1 = max(box1_coords[1], box2_coords[1])
-    x2 = min(box1_coords[2], box2_coords[2])
-    y2 = min(box1_coords[3], box2_coords[3])
-    
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    
-    # Calculate areas
-    box1_area = (box1_coords[2] - box1_coords[0]) * (box1_coords[3] - box1_coords[1])
-    box2_area = (box2_coords[2] - box2_coords[0]) * (box2_coords[3] - box2_coords[1])
-    
-    # Calculate IoU
-    union = box1_area + box2_area - intersection
-    return intersection / union if union > 0 else 0
-
-def remove_duplicates(results, iou_threshold=0.5):
-    filtered_results = []
-    used = set()
-    
-    for i, res1 in enumerate(results):
-        if i in used:
-            continue
-            
-        current_group = [res1]
-        used.add(i)
-        
-        for j, res2 in enumerate(results[i+1:], i+1):
-            if j in used:
-                continue
-                
-            # Calculate IoU between boxes
-            box1 = np.array(res1[0])
-            box2 = np.array(res2[0])
-            iou = calculate_iou(box1, box2)
-            
-            if iou > iou_threshold:
-                current_group.append(res2)
-                used.add(j)
-        
-        # From the current group, select the one with highest confidence
-        best_result = max(current_group, key=lambda x: x[2] if len(x) > 2 else 0)
-        filtered_results.append(best_result)
-    
-    return filtered_results
-
-def extract_text_and_confidence_easyocr(results):
-    """Extract text and confidence scores from EasyOCR result."""
-    extracted_data = []
-    combined_text = ""
-    
-    for bbox, text, prob in results:
-        # Add to combined text for summarization
-        combined_text += text + " "
-        
-        extracted_data.append({
-            "text": text,
-            "confidence": float(prob),
-            "box": bbox
-        })
-    
-    # Get summary using Groq if text is available
-    summary = ""
-    if combined_text.strip():
-        try:
-            chat_completion = groq_client.chat.completions.create(
-                messages=[{
-                    "role": "user",
-                    "content": f"""
-You are a highly specialized AI trained in medical terminology, prescriptions, and pharmaceutical guidelines. 
-Your task is to summarize the given medical prescription text while prioritizing **medicine names, dosages, 
-frequencies, duration, medical conditions, and important instructions.**  
-
-### **Instructions:**  
-- **Extract and emphasize medicine names** mentioned in the text.  
-- **Highlight dosages, intake frequency, and duration** (e.g., "500mg, twice a day for 5 days").  
-- **Identify any diseases or medical conditions** mentioned in the prescription.  
-- **Retain important doctor instructions** (e.g., "Take before meals", "Avoid alcohol", "Complete full course").  
-- **Ignore irrelevant details** like hospital branding, unnecessary general text, or non-medical content.  
-
-### **Prescription Text:**  
-{combined_text}  
-
-### **Expected Output:**  
-A concise summary focusing only on **medical aspects**, ensuring that key prescription details (medicines, 
-dosages, diseases, and instructions) are retained accurately.
-"""
-                }],
-                model="llama-3.3-70b-versatile",
-            )
-            summary = chat_completion.choices[0].message.content
-        except Exception as e:
-            print(f"Error getting summary: {e}")
-            summary = "Error generating summary"
-    
-    return {
-        "extracted_data": extracted_data,
-        "summary": summary,
-        "full_text": combined_text.strip()
-    }
-
-def create_annotated_image(image, results):
-    # Convert PIL Image to numpy array if needed
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-    
-    annotated = image.copy()
-    
-    for result in results:
-        box = result[0]
-        text = result[1]
-        
-        # Convert box points to numpy array
-        box = np.array(box, dtype=np.int32)
-        
-        # Draw the bounding box
-        cv2.polylines(annotated, [box], True, (0, 255, 0), 2)
-        
-        # Add text above the box
-        x = min(p[0] for p in box)
-        y = min(p[1] for p in box) - 10
-        cv2.putText(annotated, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    
-    return Image.fromarray(annotated)
-
-# Add this new route to your FastAPI app
-@app.post("/process-multilingual")
-async def process_multilingual(file: UploadFile = File(...)):
-    try:
-        # Define language pairs (each with English)
-        language_pairs = [
-            ['en', 'hi'],  # English + Hindi
-            ['en', 'bn'],  # English + Bengali
-            ['en', 'ta'],  # English + Tamil
-            ['en', 'te'],  # English + Telugu
-            ['en', 'kn'],  # English + Kannada
-        ]
-        
-        # Read image file
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        
-        # Convert PIL Image to numpy array
-        img_array = np.array(image)
-        
-        all_results = []
-        processing_times = {}
-        
-        # Process with each language pair
-        for lang_pair in language_pairs:
+        # Try different formats until one works
+        for format_name in formats_to_try:
+            format_str = format_name if format_name else "generic format"
             try:
-                start_time = time.time()
-                reader = get_easyocr_reader(lang_pair)
-                if not reader:
-                    continue
+                logger.info(f"Attempting to convert audio as {format_str}...")
                 
-                # Perform OCR
-                results = reader.readtext(img_array)
-                processing_time = time.time() - start_time
-                processing_times["-".join(lang_pair)] = processing_time
-                
-                all_results.extend(results)
+                if format_name == 'wav':
+                    audio = AudioSegment.from_wav(temp_input_path)
+                elif format_name:
+                    audio = AudioSegment.from_file(temp_input_path, format=format_name)
+                else:
+                    audio = AudioSegment.from_file(temp_input_path)
+                    
+                logger.info(f"Successfully loaded audio as {format_str}")
+                break  # Exit loop if successful
                 
             except Exception as e:
-                print(f"Error processing {lang_pair}: {str(e)}")
+                last_error = e
+                logger.error(f"{format_str.capitalize()} conversion failed: {str(e)}")
         
-        if not all_results:
-            return {
-                "results": [],
-                "message": "No text detected in image"
-            }
+        # If all attempts failed
+        if audio is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not convert audio file: {str(last_error)}. Please try recording again."
+            )
+
+        # Process the audio
+        logger.info("Processing audio...")
+        audio = audio.set_channels(1)  # Convert to mono
+        audio = audio.set_frame_rate(16000)  # Set sample rate to 16kHz
         
-        # Remove duplicates based on bounding box overlap
-        final_results = remove_duplicates(all_results)
+        # Export as WAV
+        logger.info("Exporting to WAV format...")
+        audio.export(temp_output_path, format='wav')
+        logger.info("Successfully exported to WAV")
         
-        # Extract text and confidence scores
-        extracted_data = extract_text_and_confidence_easyocr(final_results)
+        # Verify the output file
+        if not os.path.exists(temp_output_path) or os.path.getsize(temp_output_path) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create valid output file"
+            )
         
-        # Generate annotated image
-        try:
-            annotated_image = create_annotated_image(image, final_results)
+        logger.info("Audio conversion completed successfully")
+        return temp_output_path, temp_dir
             
-            # Save annotated image to bytes
-            img_byte_arr = io.BytesIO()
-            annotated_image.save(img_byte_arr, format='PNG')
-            annotated_image_bytes = img_byte_arr.getvalue()
-            
-        except Exception as e:
-            print(f"Error generating annotated image: {str(e)}")
-            annotated_image_bytes = None
-        
-        # Calculate average confidence
-        confidences = [item["confidence"] for item in extracted_data["extracted_data"]]
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-        
-        # Extract text by language (basic approach)
-        language_texts = {}
-        for lang_pair in language_pairs:
-            lang_code = lang_pair[1]  # Non-English language code
-            language_texts[lang_code] = []
-        
-        # Just collecting all texts (a smarter approach would use language detection)
-        full_text = extracted_data["full_text"]
-        
-        return {
-            "results": extracted_data["extracted_data"],
-            "structured_data": {
-                "raw_text": full_text,
-                "confidence": avg_confidence,
-                "processing_times": processing_times,
-                "languages_detected": list(language_pairs)
-            },
-            "annotated_image": annotated_image_bytes
-        }
+    except HTTPException:
+        # Cleanup before re-raising
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
         
     except Exception as e:
-        print(f"Error processing multilingual image: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing multilingual image: {str(e)}")
+        logger.error(f"Error in audio handling: {str(e)}")
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process audio file: {str(e)}. Please try again."
+        )
+
+def cleanup_files(input_path=None, output_path=None, dir_path=None):
+    """Helper function to clean up temporary files."""
+    try:
+        # Close any open file handles
+        import gc
+        gc.collect()
+        
+        # Remove input file if it exists
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove input file: {str(e)}")
+        
+        # Remove output file if it exists
+        if output_path and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove output file: {str(e)}")
+        
+        # Remove directory if it exists
+        if dir_path and os.path.exists(dir_path):
+            try:
+                os.rmdir(dir_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary directory: {str(e)}")
+                
+    except Exception as e:
+        logger.warning(f"Error during cleanup: {str(e)}")
+
+def transcribe_audio_file(audio_file_path):
+    """Transcribe audio file using speech recognition."""
+    try:
+        # Initialize recognizer
+        recognizer = sr.Recognizer()
+        
+        # Load the audio file
+        with sr.AudioFile(audio_file_path) as source:
+            # Record the audio data
+            audio_data = recognizer.record(source)
+            
+            try:
+                # Try Google Speech Recognition
+                text = recognizer.recognize_google(audio_data)
+                logger.info("Successfully transcribed audio using Google Speech Recognition")
+                return text
+            except sr.RequestError as e:
+                logger.error(f"Could not request results from Google Speech Recognition service: {e}")
+                raise
+            except sr.UnknownValueError:
+                logger.error("Google Speech Recognition could not understand audio")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not understand audio. Please speak clearly and try again."
+                )
+            
+    except Exception as e:
+        logger.error(f"Error in transcribe_audio_file: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process audio file. Please try again."
+        )
 
 def add_ocr_routes(app: FastAPI):
-    reader = get_easyocr_reader()
-    
-    @app.post("/ocr/process-prescription")
-    async def process_prescription(file: UploadFile = File(...)):
-        """Process a prescription image using OCR."""
-        try:
-            # Read and validate the image
-            contents = await file.read()
-            image = Image.open(io.BytesIO(contents))
-            
-            # Convert image to RGB if necessary
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            # Perform OCR
-            results = reader.readtext(np.array(image))
-            
-            # Remove duplicate detections
-            filtered_results = remove_duplicates(results)
-            
-            # Extract text and confidence
-            text, confidence = extract_text_and_confidence(filtered_results)
-            
-            # Create annotated image
-            annotated_image = create_annotated_image(image, filtered_results)
-            
-            # Convert annotated image to bytes
-            annotated_bytes = io.BytesIO()
-            annotated_image.save(annotated_bytes, format='PNG')
-            
-            return {
-                "text": text,
-                "confidence": confidence,
-                "word_count": len(text.split()),
-                "details": [
-                    {
-                        "text": r[1],
-                        "confidence": r[2] if len(r) > 2 else 0,
-                        "box": r[0]
-                    } for r in filtered_results
-                ]
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing prescription: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    @app.post("/ocr/process-multilingual")
-    async def process_multilingual(
-        file: UploadFile = File(...),
-        languages: List[str] = ['en']  # Default to English
-    ):
-        """Process an image with multilingual OCR support."""
-        try:
-            # Initialize reader with specified languages
-            multi_reader = get_easyocr_reader(languages)
-            if not multi_reader:
-                raise HTTPException(status_code=500, detail="Failed to initialize OCR reader")
-            
-            # Read and validate the image
-            contents = await file.read()
-            image = Image.open(io.BytesIO(contents))
-            
-            # Convert image to RGB if necessary
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            # Perform OCR
-            results = multi_reader.readtext(np.array(image))
-            
-            # Remove duplicate detections
-            filtered_results = remove_duplicates(results)
-            
-            # Extract text and confidence
-            text, confidence = extract_text_and_confidence(filtered_results)
-            
-            return {
-                "text": text,
-                "confidence": confidence,
-                "languages": languages,
-                "word_count": len(text.split()),
-                "details": [
-                    {
-                        "text": r[1],
-                        "confidence": r[2] if len(r) > 2 else 0,
-                        "box": r[0]
-                    } for r in filtered_results
-                ]
-            }
-            
-        except Exception as e:
-            logger.error(f"Error processing multilingual text: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    @app.get("/ocr/health")
-    async def health_check():
-        """Check if OCR service is healthy."""
-        return {
-            "status": "ok",
-            "message": "OCR service is running",
-            "reader_initialized": reader is not None
-        }
-    
-    logger.info("OCR routes added to FastAPI app")
+    @app.get("/ocr-status")
+    async def ocr_status():
+        return {"status": "healthy", "message": "OCR Service is running"}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    @app.post("/transcribe-audio")
+    async def transcribe_audio(audio_file: UploadFile = File(...)):
+        """
+        Endpoint to transcribe audio file and extract information.
+        """
+        try:
+            # Create temporary directory for audio processing
+            audio_bytes = await audio_file.read()
+            temp_output_path, temp_dir = await convert_audio_to_wav(audio_bytes)
+            
+            try:
+                # Transcribe the audio file
+                transcribed_text = transcribe_audio_file(temp_output_path)
+                
+                # Extract information from transcribed text
+                patient_name, doctor_name = extract_names(transcribed_text)
+                date = extract_date(transcribed_text)
+                medicines = extract_medicines(transcribed_text)
+                
+                # Return structured response
+                return {
+                    "success": True,
+                    "transcribed_text": transcribed_text,
+                    "structured_data": {
+                        "patient_name": patient_name or "Not found",
+                        "doctor_name": doctor_name or "Not found",
+                        "date": date or "Not found",
+                        "medicines": medicines or [],
+                        "confidence": 0.95,
+                        "raw_text": transcribed_text
+                    }
+                }
+            finally:
+                # Clean up temporary files
+                cleanup_files(None, temp_output_path, temp_dir)
+                
+        except HTTPException as http_error:
+            return {
+                "success": False,
+                "error": http_error.detail
+            }
+        except Exception as e:
+            logger.error(f"Error in transcribe_audio: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Failed to process audio file: {str(e)}. Please try again."
+            }
+    
+    @app.post("/process-prescription")
+    async def process_prescription(file: UploadFile = File(...)):
+        try:
+            # Initialize OCR if not already done
+            ocr_instance = get_ocr()
+            logger.info(f"Received file: {file.filename}, content type: {file.content_type}")
+            
+            # Read image file
+            contents = await file.read()
+            image = Image.open(io.BytesIO(contents))
+            nyckel_result = nyckel.invoke("prescription-pad-authenticity", "https://res.cloudinary.com/dbdgtr3re/image/upload/v1741553908/GIH/test_ocr_pnj4v2.jpg",credentials)
+            # Handle image format
+            if image.mode == 'RGBA':
+                # Create a white background image
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                # Paste the image on the background using alpha channel as mask
+                background.paste(image, mask=image.split()[3])  # 3 is the alpha channel
+                image = background
+            elif image.mode != 'RGB':
+                # Convert any other mode to RGB
+                image = image.convert('RGB')
+            
+            # Convert PIL Image to numpy array
+            img_array = np.array(image)
+            
+            # Perform OCR
+            result = ocr_instance.ocr(img_array, cls=True)
+            
+            if not result or len(result) == 0:
+                return {
+                    "results": [],
+                    "message": "No text detected in image"
+                }
+            
+            # Extract text and confidence scores
+            extracted_data = extract_text_and_confidence(result)
+            
+            # Combine all text for processing
+            full_text = extracted_data["full_text"]
+            
+            # Extract structured information
+            patient_name, doctor_name = extract_names(full_text)
+            date = extract_date(full_text)
+            medicines = extract_medicines(full_text)
+            
+            # Calculate average confidence
+            confidences = [item["confidence"] for item in extracted_data["extracted_data"]]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            
+            return {
+                "results": extracted_data["extracted_data"],
+                "summary": extracted_data["summary"],
+                "structured_data": {
+                    "patient_name": patient_name,
+                    "doctor_name": doctor_name,
+                    "date": date,
+                    "medicines": medicines,
+                    "confidence": avg_confidence,
+                    "raw_text": full_text
+                },
+                "authenticity_check": nyckel_result
+            }
+        except Exception as e:
+            logger.error(f"Error processing image: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Error processing image: {str(e)}"
+            }
