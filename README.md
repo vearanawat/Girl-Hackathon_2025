@@ -69,8 +69,8 @@ To run this project, you need to configure environment variables.
 Create a `.env` file inside the **backend** directory and add the following keys:
 
 ```sh
-GROQ_API_KEY=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
-HUGGINGFACE_API_KEY=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
+GROQ_API_KEY='yourapikey'
+HUGGINGFACE_API_KEY='yourapikey'
 ```
 
 #### **Install dependencies and run the backend**
@@ -96,8 +96,8 @@ node index.js  # Start the mail backend
 Create a `.env` file inside the **root (main)** directory and add the following keys:
 
 ```sh
-VITE_CLERK_PUBLISHABLE_KEY=pk_test_dGVuZGVyLXJhdHRsZXItNzUuY2xlcmsuYWNjb3VudHMuZGV2JA
-GEMINI_API_KEY=AIzaSyCHzoZHWJdqFeD7fCyTTeMNknq9AUZwpUM
+VITE_CLERK_PUBLISHABLE_KEY='yourapikey'
+GEMINI_API_KEY='yourapikey'
 SENDER_EMAIL=mediflow25@gmail.com
 SENDER_EMAIL_PASSWORD=rdsb umev ynct gwms
 ```
